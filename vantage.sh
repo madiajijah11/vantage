@@ -7,6 +7,14 @@ ENABLE_FAN_MODE=1
 
 VPC="/sys/bus/platform/devices/VPC2004\:*"
 
+# Resolve the platform glob in this shell: $VPC is passed to `pkexec sh -c` as a
+# double-quoted literal later, and sh -c does not glob-expand it.
+vpc_resolve() {
+    local resolved
+    resolved="$(echo $VPC/$1 2>/dev/null)"
+    [ -e "$resolved" ] && echo "$resolved"
+}
+
 # Touchpad: xinput is absent on Wayland/libinput-only systems (Pop!_OS 24.04+).
 # Fall back to the GNOME/Plasma desktop schema, which needs no root.
 touchpad_backend="none"
@@ -41,14 +49,106 @@ get_usb_charging_status() {
     fi
 }
 
+# Fan mode: the kernel sysfs ABI documents 0/1/2/4, but firmware does not
+# always use the documented encoding. Observed on IdeaPad Gaming 3 (VPC2004):
+#   write 0 -> reads back 133   (Super Silent, reported as 0x85)
+#   write 1 -> reads back 3     (Standard)
+#   write 2/4 -> readback unchanged (firmware accepts, silently no-ops)
+# So the read value must be decoded through a map, and a write must be verified
+# against a fresh read before the UI claims success.
+FAN_MODE_VALUES=(0 1 2 4)
+
+fan_mode_label_for_value() {
+    case "$1" in
+        0) echo "Super Silent" ;;
+        1) echo "Standard" ;;
+        2) echo "Dust Cleaning" ;;
+        4) echo "Efficient Thermal Dissipation" ;;
+    esac
+}
+
+fan_mode_label_for() {
+    case "$1" in
+        0|133) echo "Super Silent" ;;
+        1|3)   echo "Standard" ;;
+        2)     echo "Dust Cleaning" ;;
+        4)     echo "Efficient Thermal Dissipation" ;;
+        *)     echo "Unknown ($1)" ;;
+    esac
+}
+
 get_fan_mode_status() {
-    cat $VPC/fan_mode | awk '{
-        if ($1 == "133" || $1 == "0") print "Super Silent";
-        else if ($1 == "1") print "Standard";
-        else if ($1 == "2") print "Dust Cleaning";
-        else if ($1 == "4") print "Efficient Thermal Dissipation";
-        else print "Unknown (" $1 ")";
-    }'
+    fan_mode_label_for "$(cat "$(vpc_resolve fan_mode)" 2>/dev/null)"
+}
+
+# Modes the firmware actually applies. Probed once and cached: writing a mode
+# the firmware ignores reports success at the sysfs level but changes nothing.
+FAN_MODE_PROBE_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/vantage/fan-mode-supported"
+
+fan_modes_supported() {
+    if [ -r "$FAN_MODE_PROBE_CACHE" ]; then
+        cat "$FAN_MODE_PROBE_CACHE"
+        return
+    fi
+
+    local fan_path current supported value before readback attempt restored
+    fan_path="$(vpc_resolve fan_mode)"
+    [ -n "$fan_path" ] || { echo ""; return; }
+
+    current="$(cat "$fan_path" 2>/dev/null)"
+    supported=""
+    for value in "${FAN_MODE_VALUES[@]}"; do
+        before="$(cat "$fan_path" 2>/dev/null)"
+        pkexec sh -c "echo $value > $fan_path" >/dev/null 2>&1 || continue
+        # EC apply is asynchronous; poll until the readback settles.
+        attempt=0
+        readback="$before"
+        while [ $attempt -lt 6 ]; do
+            sleep 0.5
+            readback="$(cat "$fan_path" 2>/dev/null)"
+            [ "$readback" != "$before" ] && break
+            attempt=$((attempt + 1))
+        done
+        [ "$readback" != "$before" ] && supported="$supported $value"
+    done
+
+    # Restore whatever the user had before probing. Firmware readback values are
+    # not always the documented write values (the kernel rejects anything >4), so
+    # map back where known and tell the user when we cannot restore exactly.
+    local restored=1
+    case "$current" in
+        0|1|2|4) pkexec sh -c "echo $current > $fan_path" >/dev/null 2>&1 ;;
+        133) pkexec sh -c "echo 0 > $fan_path" >/dev/null 2>&1 ;;
+        3)   pkexec sh -c "echo 1 > $fan_path" >/dev/null 2>&1 ;;
+        "")  restored=0 ;;
+        *)   restored=0 ;;  # undocumented encoding, not writable
+    esac
+    [ $restored -eq 0 ] && notify_error \
+        "Fan mode was '$current' before this probe, an encoding this tool cannot write back. It is now '$(get_fan_mode_status)'."
+
+    mkdir -p "$(dirname "$FAN_MODE_PROBE_CACHE")"
+    echo "$supported" > "$FAN_MODE_PROBE_CACHE"
+    echo "$supported"
+}
+
+fan_mode_set() {
+    local value="$1" expected="$2" attempt=0 readback="" fan_path
+    fan_path="$(vpc_resolve fan_mode)"
+    [ -n "$fan_path" ] || { notify_error "fan_mode is not available on this model."; return 1; }
+
+    if ! pkexec sh -c "echo $value > $fan_path" >/dev/null 2>&1; then
+        notify_error "Could not write fan mode (permission or firmware error)."
+        return 1
+    fi
+    # EC apply is asynchronous; give it up to 3s to settle, then verify.
+    while [ $attempt -lt 6 ]; do
+        sleep 0.5
+        readback="$(cat "$fan_path" 2>/dev/null)"
+        attempt=$((attempt + 1))
+        [ "$(fan_mode_label_for "$readback")" = "$expected" ] && return 0
+    done
+    notify_error "Firmware did not apply '$expected' (fan mode reads $readback)."
+    return 1
 }
 
 get_fn_lock_status() {
@@ -93,6 +193,13 @@ get_wifi_status() {
 SUBMENU_ON="Activate"
 SUBMENU_OFF="Deactivate"
 
+notify_error() {
+    command -v zenity >/dev/null && \
+        zenity --error --title="Lenovo Vantage" --text="$1" 2>/dev/null
+    [ $? -ne 0 ] && echo "$1" >&2
+    return 0
+}
+
 show_submenu() {
     local title="$1"
     local status="$2"
@@ -132,18 +239,27 @@ main() {
                 esac
                 ;;
             "Fan Mode")
-                local submenu="$(show_submenu "Fan Mode" "$(get_fan_mode_status)" --height 250 --width 300 \
-                    "Super Silent" \
-                    "Standard" \
-                    "Dust Cleaning" \
-                    "Efficient Thermal Dissipation" \
-                )"
-                case "$submenu" in
-                    "Super Silent") echo "0" | pkexec tee $VPC/fan_mode ;;
-                    "Standard") echo "1" | pkexec tee $VPC/fan_mode ;;
-                    "Dust Cleaning") echo "2" | pkexec tee $VPC/fan_mode ;;
-                    "Efficient Thermal Dissipation") echo "4" | pkexec tee $VPC/fan_mode ;;
-                esac
+                # Only offer modes the firmware actually applies on this model.
+                # fan_map[label] = sysfs write value (indexes are not parallel:
+                # fan_items only holds the supported subset).
+                local -a fan_items=()
+                declare -A fan_map=()
+                local supported supported_list
+                supported_list=" $(fan_modes_supported) "
+                for supported in "${FAN_MODE_VALUES[@]}"; do
+                    case "$supported_list" in
+                        *" $supported "*)
+                            fan_map["$(fan_mode_label_for_value "$supported")"]="$supported"
+                            fan_items+=("$(fan_mode_label_for_value "$supported")")
+                            ;;
+                    esac
+                done
+                if [ ${#fan_items[@]} -eq 0 ]; then
+                    notify_error "No fan mode could be applied on this model."
+                    break
+                fi
+                local submenu="$(show_submenu "Fan Mode" "$(get_fan_mode_status)" --height 250 --width 300 "${fan_items[@]}")"
+                [ -n "${fan_map[$submenu]:-}" ] && fan_mode_set "${fan_map[$submenu]}" "$submenu"
                 ;;
             "FN Lock")
                 local submenu="$(show_submenu_on_off "FN Lock" "$(get_fn_lock_status)")"
