@@ -7,14 +7,38 @@ ENABLE_FAN_MODE=1
 
 VPC="/sys/bus/platform/devices/VPC2004\:*"
 
-touchpad_id="$(xinput list | grep "Touchpad" | cut -d '=' -f2 | awk '{print $1}')"
+# Touchpad: xinput is absent on Wayland/libinput-only systems (Pop!_OS 24.04+).
+# Fall back to the GNOME/Plasma desktop schema, which needs no root.
+touchpad_backend="none"
+touchpad_id=""
+if command -v xinput >/dev/null && touchpad_id="$(xinput list | grep "Touchpad" | cut -d '=' -f2 | awk '{print $1}')" && [ -n "$touchpad_id" ]; then
+    touchpad_backend="xinput"
+elif command -v gsettings >/dev/null && gsettings list-schemas | grep -q "peripherals.touchpad"; then
+    touchpad_backend="gsettings"
+fi
+
+# Refuse to run on hardware without the Lenovo Ideapad ACPI platform: the $VPC
+# glob would expand to nothing and every status read below would fail.
+if [ ! -e $VPC/conservation_mode ] && [ ! -e $VPC/fn_lock ]; then
+    if command -v zenity >/dev/null; then
+        zenity --error --title="Lenovo Vantage" \
+            --text="No Lenovo Ideapad ACPI platform found (VPC2004).\n\nThis tool only supports Lenovo IdeaPad and ThinkPad laptops." 2>/dev/null
+    else
+        echo "No Lenovo Ideapad ACPI platform found (VPC2004)." >&2
+    fi
+    exit 1
+fi
 
 get_conservation_mode_status() {
     cat $VPC/conservation_mode | awk '{print ($1 == "1") ? "On" : "Off"}'
 }
 
 get_usb_charging_status() {
-    cat $VPC/usb_charging | awk '{print ($1 == "1") ? "On" : "Off"}'
+    if [ -e $VPC/usb_charging ]; then
+        cat $VPC/usb_charging | awk '{print ($1 == "1") ? "On" : "Off"}'
+    else
+        echo "Not available on this model"
+    fi
 }
 
 get_fan_mode_status() {
@@ -23,6 +47,7 @@ get_fan_mode_status() {
         else if ($1 == "1") print "Standard";
         else if ($1 == "2") print "Dust Cleaning";
         else if ($1 == "4") print "Efficient Thermal Dissipation";
+        else print "Unknown (" $1 ")";
     }'
 }
 
@@ -39,7 +64,26 @@ get_microphone_status() {
 }
 
 get_touchpad_status() {
-    xinput --list-props "$touchpad_id" | grep "Device Enabled" | cut -d ':' -f2 | awk '{print ($1 == "1") ? "On" : "Off"}'
+    case $touchpad_backend in
+        xinput)
+            xinput --list-props "$touchpad_id" | grep "Device Enabled" | cut -d ':' -f2 | awk '{print ($1 == "1") ? "On" : "Off"}'
+            ;;
+        gsettings)
+            gsettings get org.gnome.desktop.peripherals.touchpad send-events | tr -d "'" | awk '{print ($1 == "enabled") ? "On" : "Off"}'
+            ;;
+        *)
+            echo "Unsupported"
+            ;;
+    esac
+}
+
+touchpad_set_enabled() {
+    local state="$1" # true | false
+    case $touchpad_backend in
+        xinput) xinput --enable "$touchpad_id" "$([ "$state" = true ] && echo 1 || echo 0)" ;;
+        gsettings) gsettings set org.gnome.desktop.peripherals.touchpad send-events "$([ "$state" = true ] && echo enabled || echo disabled)" ;;
+        *) echo "Touchpad control unsupported on this system." >&2; return 1 ;;
+    esac
 }
 
 get_wifi_status() {
@@ -68,7 +112,7 @@ main() {
         test -f $VPC/fn_lock && options+=("FN Lock" "$(get_fn_lock_status)")
         modinfo -n uvcvideo >/dev/null && options+=("Camera" "$(get_camera_status)")
         which pactl >/dev/null && options+=("Microphone" "$(get_microphone_status)")
-        test -n "$touchpad_id" && options+=("Touchpad" "$(get_touchpad_status)")
+        test "$touchpad_backend" != none && options+=("Touchpad" "$(get_touchpad_status)")
         which nmcli >/dev/null && options+=("WiFi" "$(get_wifi_status)")
 
         local menu="$(zenity --list --title "Lenovo Vantage" --text "Select function:" --column "Function" --column "Status" "${options[@]}" --height 340 --width 350)"
@@ -128,8 +172,8 @@ main() {
             "Touchpad")
                 local submenu="$(show_submenu_on_off "Touchpad" "$(get_touchpad_status)")"
                 case "$submenu" in
-                    "$SUBMENU_ON") xinput enable "$touchpad_id" ;;
-                    "$SUBMENU_OFF") xinput disable "$touchpad_id" ;;
+                    "$SUBMENU_ON") touchpad_set_enabled true ;;
+                    "$SUBMENU_OFF") touchpad_set_enabled false ;;
                 esac
                 ;;
             "WiFi")
